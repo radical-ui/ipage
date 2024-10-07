@@ -1,283 +1,247 @@
-import Foundation
-
-class Bridge {
-    var onError: ((String) -> Void)?
-    var onNoInternet: (() -> Void)?
-    var onHasInternet: (() -> Void)?
-    var onObjectSet: ((String, Object) -> Void)?
-    var onObjectRemoved: ((String) -> Void)?
-    var onThemeSet: ((Theme) -> Void)?
-    var onDidLoad: (() -> Void)?
-    
-    private var isOffline = false
-    private var url: URL?
-    private var websocketTask: URLSessionWebSocketTask?
-    
-    func start(url: String) {
-        let uuid = UUID().uuidString
-        print("starting session \(uuid)")
-        
-        guard let url = URL(string: "\(url)?session_id=\(uuid)") else {
-            callError("Invalid url: \(url)")
-            return
-        }
-        
-        self.url = url
-        self.connect()
-    }
-    
-    func watch(_ id: String) {
-        sendMessage(OutgoingMessage<Never>.watch(OutgoingMessage.Watch(id: id)))
-    }
-    
-    func unwatch(_ id: String) {
-        sendMessage(OutgoingMessage<Never>.unwatch(OutgoingMessage.Unwatch(id: id)))
-    }
-    
-    func fireEvent<T: Encodable>(key: String, data: T) {
-        sendMessage(OutgoingMessage.emitEvent(OutgoingMessage.EmitEvent(key: key, data: data)))
-    }
-    
-    private func callError(_ message: String) {
-        if let onError = self.onError {
-            onError(message)
-        } else {
-            print("Unhandled error: \(message)")
-        }
-    }
-    
-    private func sendMessage<T: Encodable>(_ message: OutgoingMessage<T>) {
-        guard let task = self.websocketTask else {
-            print("must call start before watch or fireEvent")
-            return
-        }
-        
-        let encoder = JSONEncoder()
-        encoder.keyEncodingStrategy = .convertToSnakeCase
-        
-        guard let json = try? encoder.encode(message) else {
-            print("Failed to encode")
-            return
-        }
-        
-        task.send(.string(String(decoding: json, as: UTF8.self))) { error in
-            if let error = error {
-                print("An error occurred: \(error)")
-            }
-        }
-    }
-    
-    private func recieveMessage() {
-        websocketTask?.receive { result in
-            switch result {
-            case .success(let message):
-                if self.isOffline {
-                    print("Websocket connected")
-                    self.isOffline = false
-                    
-                    if let onHasInternet = self.onHasInternet {
-                        onHasInternet()
-                    }
-                }
-                
-                switch message {
-                case .string(let data):
-                    for message in self.parseIncomingJson(data: data) {
-                        self.handleIncomingMessage(message)
-                    }
-            
-                    self.recieveMessage()
-                default:
-                    self.callError("Non-binary message type recieved")
-                }
-            case .failure(let error):
-                print("Socket error: \(error.localizedDescription)")
-                
-                if error.localizedDescription == "Could not connect to the server." && self.onNoInternet != nil {
-                    print("Websocket connection failed")
-                    
-                    self.isOffline = true
-                    self.onNoInternet!()
-                    self.queueRetry()
-                } else if error.localizedDescription == "The operation couldn’t be completed. Socket is not connected" {
-                    // the socket was suddenly closed (server probably restarted, internet was lost, or ios killed the connection)
-                    // if we can reconnect, no error will flash to the user. If not, they will get the standard "no internet" behavior
-                    self.queueRetry()
-                } else {
-                    self.callError(error.localizedDescription)
-                }
-            }
-        }
-    }
-    
-    private func parseIncomingJson(data: String) -> [IncomingMessage] {
-        let decoder = JSONDecoder()
-        decoder.keyDecodingStrategy = .convertFromSnakeCase
-        
-        do {
-            return try decoder.decode([IncomingMessage].self, from: Data(data.utf8))
-        } catch {
-            self.callError("Failed to parse json response")
-            
-            print("failed to parse json of incoming message: \(error). JSON: \(data)")
-            
-            return []
-        }
-    }
-    
-    private func queueRetry() {
-        self.websocketTask?.cancel()
-        
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
-            print("Retrying websocket connnection...")
-            self.connect()
-        }
-    }
-    
-    private func connect() {
-        guard let url = url else {
-            print("Must call .start() before .connect()")
-            return
-        }
-        
-        websocketTask = URLSession(configuration: .default).webSocketTask(with: url)
-        websocketTask?.resume()
-        recieveMessage()
-    }
-
-    private func handleIncomingMessage(_ message: IncomingMessage) {
-        switch message {
-        case .initialize(let initalizeMessage):
-            guard let onDidLoad = self.onDidLoad else {
-                print("Init was sent, but nobody was listening for onDidLoad")
-                return
-            }
-            
-            guard let onThemeSet = self.onThemeSet else {
-                print("Init theme was set, but nobody was listening: \(initalizeMessage.theme)")
-                return
-            }
-            
-            guard let onObjectSet = self.onObjectSet else {
-                print("Init objects were set, but nobody was listening: \(initalizeMessage.objects)")
-                return
-            }
-            
-            for (id, object) in initalizeMessage.objects {
-                onObjectSet(id, object)
-            }
-            
-            onThemeSet(initalizeMessage.theme)
-            
-            onDidLoad()
-        case .removeObject(let removeObjectMessage):
-            guard let onObjectRemoved = self.onObjectRemoved else {
-                print("An object was removed, but nobody was listening")
-                return
-            }
-            
-            onObjectRemoved(removeObjectMessage.id)
-        case .setObject(let setObjectMessage):
-            guard let onObjectSet = self.onObjectSet else {
-                print("An object was set, but nobody was listening")
-                return
-            }
-            
-            onObjectSet(setObjectMessage.id, setObjectMessage.object)
-        case .setTheme(let setThemeMessage):
-            guard let onThemeSet = self.onThemeSet else {
-                print("The theme was set, but nobody was listening")
-                return
-            }
-            
-            onThemeSet(setThemeMessage.theme)
-        case .acknowledge(let acknowledgeMessage):
-            print("Acknowledge:", acknowledgeMessage)
-        }
-    }
-}
-
-private enum OutgoingMessage<EventData: Encodable>: Encodable {
-    struct Watch: Encodable {
-        let id: String
-    }
-    case watch(Watch)
-    
-    struct Unwatch: Encodable {
-        let id: String
-    }
-    case unwatch(Unwatch)
-    
-    struct EmitEvent<T: Encodable>: Encodable {
-        let key: String
-        let data: T
-    }
-    case emitEvent(EmitEvent<EventData>)
-    
-    func encode(to encoder: any Encoder) throws {
-        var container = encoder.container(keyedBy: EnumKeys.self)
-        
-        switch self {
-        case .watch(let watch):
-            try container.encode("watch", forKey: .kind)
-            try container.encode(watch, forKey: .def)
-        case .unwatch(let unwatch):
-            try container.encode("unwatch", forKey: .kind)
-            try container.encode(unwatch, forKey: .def)
-        case .emitEvent(let emitEvent):
-            try container.encode("emit_event", forKey: .kind)
-            try container.encode(emitEvent, forKey: .def)
-        }
-    }
-}
-
-private enum IncomingMessage: Decodable {
-    struct Init: Decodable {
-        let theme: Theme
-        let objects: [String: Object]
-    }
-    case initialize(Init)
-    
-    struct RemoveObject: Decodable {
-        let id: String
-    }
-    case removeObject(RemoveObject)
-    
-    struct SetObject: Decodable {
-        let id: String
-        let object: Object
-    }
-    case setObject(SetObject)
-
-    struct SetTheme: Decodable {
-        let theme: Theme
-    }
-    case setTheme(SetTheme)
-
-    struct Acknowledge: Decodable {
-        let requestId: UUID?
-        let error: String?
-        let retryAfterSeconds: Int?
-    }
-    case acknowledge(Acknowledge)
-    
-    init(from decoder: any Decoder) throws {
-        let container = try decoder.container(keyedBy: EnumKeys.self)
-        let kind = try container.decode(String.self, forKey: .kind)
-        
-        switch kind {
-        case "init":
-            self = .initialize(try container.decode(Init.self, forKey: .def))
-        case "remove_object":
-            self = .removeObject(try container.decode(RemoveObject.self, forKey: .def))
-        case "set_object":
-            self = .setObject(try container.decode(SetObject.self, forKey: .def))
-        case "set_theme":
-            self = .setTheme(try container.decode(SetTheme.self, forKey: .def))
-        case "acknowledge":
-            self = .acknowledge(try container.decode(Acknowledge.self, forKey: .def))
-        default:
-            throw DecodingError.dataCorruptedError(forKey: .kind, in: container, debugDescription: "Unknown kind: \(kind)")
-        }
-    }
-}
+//import Foundation
+//import Combine
+//
+//class Bridge {
+//    private var logger: Logger
+//    private var session: Session
+//    private var cancellables = Set<AnyCancellable>()
+//
+//    var onError: Listener<String>
+//    var onHasInternet: Listener<Bool>
+//    var onObjectSet: Listener<(String, Object)>
+//    var onObjectRemoved: Listener<String>
+//
+//    private var isOffline = false
+//    private var url: String?
+//    private var websocket: URLSessionWebSocketTask?
+//    private var isRunning = false
+//
+//    private let jsonEncoder = JSONEncoder()
+//    private let jsonDecoder = JSONDecoder()
+//    private let urlSession = URLSession(configuration: .default)
+//
+//    init(logger: Logger, session: Session) {
+//        self.logger = logger
+//        self.session = session
+//        self.onError = Listener(logger: logger)
+//        self.onHasInternet = Listener(logger: logger)
+//        self.onObjectSet = Listener(logger: logger)
+//        self.onObjectRemoved = Listener(logger: logger)
+//
+//        jsonDecoder.keyDecodingStrategy = .convertFromSnakeCase
+//    }
+//
+//    func start(url: String) {
+//        guard !isRunning else {
+//            logger.info("start called again, but skipping because bridge is already running")
+//            return
+//        }
+//        
+//        logger.info("starting")
+//
+//        self.url = "\(url)?session_id=\(session.getId())"
+//        connect()
+//    }
+//
+//    func watch(objectId: String, onComplete: @escaping () -> Void) {
+//        sendMessage(
+//            OutgoingMessage.watch(requestId: listenForAcknowledgement(onComplete), id: objectId)
+//        )
+//    }
+//
+//    func unwatch(objectId: String, onComplete: @escaping () -> Void) {
+//        sendMessage(
+//            OutgoingMessage.unwatch(requestId: listenForAcknowledgement(onComplete), id: objectId)
+//        )
+//    }
+//
+//    func emitBindingUpdate(key: String, data: JsonElement, onComplete: @escaping () -> Void) {
+//        sendMessage(
+//            OutgoingMessage.emitBindingUpdate(requestId: listenForAcknowledgement(onComplete), key: key, data: data)
+//        )
+//    }
+//
+//    private func listenForAcknowledgement(_ callback: @escaping () -> Void) -> String {
+//        return UUID().uuidString
+//    }
+//
+//    private func callError(message: String) {
+//        onError.emit(message)
+//    }
+//
+//    private func sendMessage(_ message: OutgoingMessage) {
+//        guard let websocket = websocket else {
+//            logger.error("must call start() before watch() or fireEvent()")
+//            return
+//        }
+//        
+//        do {
+//            let jsonMessage = try jsonEncoder.encode(message)
+//            let jsonString = String(data: jsonMessage, encoding: .utf8) ?? "{}"
+//            websocket.send(.string(jsonString)) { error in
+//                if let error = error {
+//                    self.logger.error("Error sending message: \(error)")
+//                }
+//            }
+//        } catch {
+//            logger.error("Failed to encode message: \(error)")
+//        }
+//    }
+//
+//    private func parseIncomingJson(_ data: String) -> [IncomingMessage] {
+//        do {
+//            let messages = try jsonDecoder.decode([IncomingMessage].self, from: Data(data.utf8))
+//            return messages
+//        } catch {
+//            callError("Failed to parse information from server.")
+//            logger.critical("failed to parse json of incoming message: \(error). JSON: \(data)")
+//            return []
+//        }
+//    }
+//
+//    private func queueRetry() {
+//        logger.info("retrying websocket connection")
+//        DispatchQueue.global().asyncAfter(deadline: .now() + 3) {
+//            self.connect()
+//        }
+//    }
+//
+//    private func connect() {
+//        logger.info("connecting")
+//
+//        guard let url = url else {
+//            logger.error("must call .start() before .connect()")
+//            return
+//        }
+//
+//        websocket = urlSession.webSocketTask(with: URL(string: url)!)
+//        websocket?.resume()
+//
+//        listenForMessages()
+//    }
+//
+//    private func listenForMessages() {
+//        websocket?.receive { result in
+//            switch result {
+//            case .success(let message):
+//                switch message {
+//                case .string(let text):
+//                    self.parseIncomingJson(text).forEach { self.handleIncomingMessage($0) }
+//                default:
+//                    break
+//                }
+//                self.listenForMessages() // Listen for the next message
+//            case .failure(let error):
+//                self.handleWebSocketError(error)
+//            }
+//        }
+//    }
+//
+//    private func handleWebSocketError(_ error: Error) {
+//        logger.warn("WebSocket error: \(error)")
+//        isOffline = true
+//        onHasInternet.emit(false)
+//        queueRetry()
+//    }
+//
+//    private func handleIncomingMessage(_ message: IncomingMessage) {
+//        switch message {
+//        case let .removeObject(id):
+//            onObjectRemoved.emit(id)
+//        case let .setObject(id, data):
+//            onObjectSet.emit((id, data))
+//        case let .acknowledge(requestId, error, retryAfterSeconds):
+//            logger.warn("TODO acknowledge: \(requestId ?? "")")
+//        }
+//    }
+//}
+//
+//// OutgoingMessage and IncomingMessage definitions
+//
+//enum OutgoingMessage: Codable {
+//    case watch(requestId: String, id: String)
+//    case unwatch(requestId: String, id: String)
+//    case emitBindingUpdate(requestId: String, key: String, data: JsonElement)
+//
+//    enum CodingKeys: String, CodingKey {
+//        case requestId = "request_id"
+//        case id
+//        case key
+//        case data
+//    }
+//
+//    enum MessageType: String, Codable {
+//        case watch = "watch"
+//        case unwatch = "unwatch"
+//        case emitBindingUpdate = "emit_binding_update"
+//    }
+//
+//    enum CodingError: Error {
+//        case unknownMessageType
+//    }
+//
+//    init(from decoder: Decoder) throws {
+//        let container = try decoder.container(keyedBy: CodingKeys.self)
+//        let type = try container.decode(MessageType.self, forKey: .requestId)
+//
+//        switch type {
+//        case .watch:
+//            let id = try container.decode(String.self, forKey: .id)
+//            let requestId = try container.decode(String.self, forKey: .requestId)
+//            self = .watch(requestId: requestId, id: id)
+//
+//        case .unwatch:
+//            let id = try container.decode(String.self, forKey: .id)
+//            let requestId = try container.decode(String.self, forKey: .requestId)
+//            self = .unwatch(requestId: requestId, id: id)
+//
+//        case .emitBindingUpdate:
+//            let key = try container.decode(String.self, forKey: .key)
+//            let data = try container.decode(JsonElement.self, forKey: .data)
+//            let requestId = try container.decode(String.self, forKey: .requestId)
+//            self = .emitBindingUpdate(requestId: requestId, key: key, data: data)
+//        }
+//    }
+//}
+//
+//enum IncomingMessage: Codable {
+//    case removeObject(id: String)
+//    case setObject(id: String, data: JsonElement)
+//    case acknowledge(requestId: String?, error: String?, retryAfterSeconds: Int?)
+//
+//    enum CodingKeys: String, CodingKey {
+//        case id
+//        case data
+//        case requestId = "request_id"
+//        case error
+//        case retryAfterSeconds = "retry_after_seconds"
+//    }
+//
+//    enum MessageType: String, Codable {
+//        case removeObject = "remove_object"
+//        case setObject = "set_object"
+//        case acknowledge = "acknowledge"
+//    }
+//
+//    init(from decoder: Decoder) throws {
+//        let container = try decoder.container(keyedBy: CodingKeys.self)
+//        let type = try container.decode(MessageType.self, forKey: .requestId)
+//
+//        switch type {
+//        case .removeObject:
+//            let id = try container.decode(String.self, forKey: .id)
+//            self = .removeObject(id: id)
+//
+//        case .setObject:
+//            let id = try container.decode(String.self, forKey: .id)
+//            let data = try container.decode(JsonElement.self, forKey: .data)
+//            self = .setObject(id: id, data: data)
+//
+//        case .acknowledge:
+//            let requestId = try container.decodeIfPresent(String.self, forKey: .requestId)
+//            let error = try container.decodeIfPresent(String.self, forKey: .error)
+//            let retryAfterSeconds = try container.decodeIfPresent(Int.self, forKey: .retryAfterSeconds)
+//            self = .acknowledge(requestId: requestId, error: error, retryAfterSeconds: retryAfterSeconds)
+//        }
+//    }
+//}
