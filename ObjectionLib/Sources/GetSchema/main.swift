@@ -1,8 +1,14 @@
 import Object
+import Foundation
 
-let a = 17
-let b = 25
+let json = try JSONSerialization.data(withJSONObject: [
+    "object": Object.getSchema(),
+    "initial_objects": []
+])
 
-let (result, code) = #stringify(a + b)
+let text = String(data: json, encoding: .utf8)!
 
-print("The value \(result) was produced by the code \"\(code)\"")
+var to = "\(FileManager.default.currentDirectoryPath)/schema.json"
+try json.write(to: URL(fileURLWithPath: to))
+
+print("Write schema to \(to)")
